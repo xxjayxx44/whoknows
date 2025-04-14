@@ -4,7 +4,6 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <mutex>
@@ -18,17 +17,13 @@
 #include <openssl/ripemd.h>
 #include <secp256k1.h>
 
-namespace fs = std::filesystem;
-
 // Base58 alphabet
-static const char* BASE58_ALPHABET =
-    "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+static const char* BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 // Fast xorshift64* RNG
 struct XorShift64 {
     uint64_t state;
-    XorShift64(uint64_t seed)
-        : state(seed ? seed : 0xdeadbeefcafebabeULL) {}
+    XorShift64(uint64_t seed) : state(seed ? seed : 0xdeadbeefcafebabeULL) {}
     uint64_t next() {
         uint64_t x = state;
         x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
@@ -115,7 +110,6 @@ void derive_and_check(
     secp256k1_pubkey pub;
     if (!secp256k1_ec_pubkey_create(ctx, &pub, priv.data())) return;
 
-    // uncompressed
     unsigned char buf1[65]; size_t l1 = 65;
     secp256k1_ec_pubkey_serialize(ctx, buf1, &l1, &pub, SECP256K1_EC_UNCOMPRESSED);
     std::vector<unsigned char> v1(buf1, buf1+l1);
@@ -125,7 +119,6 @@ void derive_and_check(
     a1.insert(a1.end(), h160, h160+20);
     auto addr1 = base58Check(a1);
 
-    // compressed
     unsigned char buf2[33]; size_t l2 = 33;
     secp256k1_ec_pubkey_serialize(ctx, buf2, &l2, &pub, SECP256K1_EC_COMPRESSED);
     std::vector<unsigned char> v2(buf2, buf2+l2);
@@ -149,8 +142,7 @@ void derive_and_check(
 
 // Worker thread
 void worker(const std::unordered_set<std::string>& funded) {
-    XorShift64 rng(std::hash<std::thread::id>{}(std::this_thread::get_id())
-                   ^ std::random_device{}());
+    XorShift64 rng(std::hash<std::thread::id>{}(std::this_thread::get_id()) ^ std::random_device{}());
     secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
     std::ofstream out("address.txt", std::ios::app);
 
@@ -161,8 +153,7 @@ void worker(const std::unordered_set<std::string>& funded) {
         // generate 32 random bytes
         for (int i = 0; i < 4; ++i) {
             uint64_t r = rng.next();
-            for (int b = 0; b < 8; ++b)
-                priv[i*8 + b] = (r >> (8*b)) & 0xFF;
+            for (int b = 0; b < 8; ++b) priv[i*8 + b] = (r >> (8*b)) & 0xFF;
         }
         derive_and_check(priv, ctx, funded, out);
 
@@ -174,14 +165,10 @@ void worker(const std::unordered_set<std::string>& funded) {
 }
 
 int main(int argc, char** argv) {
-    // default to looking for TSV in CWD
-    std::string path = (argc > 1) ? argv[1] : "bitcoin_addresses_latest.tsv";
-
-    // if that path is a directory, assume the file is inside it with the same name
-    if (fs::is_directory(path)) {
-        std::string name = fs::path(path).filename().string();
-        path = path + "/" + name;
-    }
+    // **Default**: look for bitcoin_addresses_latest.tsv in CWD
+    std::string path = (argc > 1)
+        ? argv[1]
+        : "bitcoin_addresses_latest.tsv";
 
     auto funded = loadFunded(path);
     std::cout << "[+] Loaded funded addresses: " << funded.size() << "\n";
@@ -190,7 +177,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // progress reporter
+    // Progress reporter
     std::thread reporter([&](){
         uint64_t prev = 0;
         while (true) {
@@ -202,10 +189,10 @@ int main(int argc, char** argv) {
         }
     });
 
-    // launch worker threads
-    unsigned int n = std::max(1u, std::thread::hardware_concurrency() - 1);
+    // Launch worker threads
+    unsigned int threads_n = std::max(1u, std::thread::hardware_concurrency() - 1);
     std::vector<std::thread> threads;
-    for (unsigned i = 0; i < n; ++i)
+    for (unsigned i = 0; i < threads_n; ++i)
         threads.emplace_back(worker, std::cref(funded));
 
     reporter.detach();
