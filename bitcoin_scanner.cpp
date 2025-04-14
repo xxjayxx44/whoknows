@@ -1,136 +1,189 @@
-#include <iostream>
+// bitcoin_scanner.cpp
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <fstream>
-#include <unordered_set>
-#include <string>
+#include <iostream>
+#include <mutex>
 #include <random>
-#include <secp256k1.h>
+#include <string>
+#include <thread>
+#include <vector>
+#include <unordered_set>
+
 #include <openssl/sha.h>
 #include <openssl/ripemd.h>
-#include <openssl/obj_mac.h>
-#include <openssl/bn.h>
-#include <openssl/ec.h>
-#include <openssl/ecdsa.h>
-#include <openssl/evp.h>
-#include <openssl/buffer.h>
-#include <algorithm>  // Include this for std::remove_if
+#include <secp256k1.h>
 
-// Base58 encoding
-const char* BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+// Base58 alphabet
+static const char* BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
-std::string base58Encode(const std::string& input) {
-    BIGNUM* bn = BN_new();
-    BN_bin2bn((const unsigned char*)input.data(), input.size(), bn);
-    BIGNUM* div = BN_new();
-    BIGNUM* rem = BN_new();
-    BN_CTX* ctx = BN_CTX_new();
+// Fast xorshift64* RNG
+struct XorShift64 {
+    uint64_t state;
+    XorShift64(uint64_t seed) : state(seed ? seed : 0xdeadbeefcafebabeULL) {}
+    uint64_t next() {
+        uint64_t x = state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        state = x;
+        return x * 0x2545F4914F6CDD1DULL;
+    }
+};
+
+// Atomic counters and synchronization
+std::atomic<uint64_t> total_checked{0};
+std::mutex file_mutex;
+
+// Load funded addresses into a hash set
+std::unordered_set<std::string> loadFunded(const std::string& path) {
+    std::ifstream in(path);
+    std::string line;
+    std::unordered_set<std::string> s;
+    s.reserve(5'000'000); // adjust to your dataset size
+    while (std::getline(in, line)) {
+        line.erase(std::remove_if(line.begin(), line.end(),
+            [](char c){ return c=='\r' || c=='\n'; }), line.end());
+        if (!line.empty()) s.insert(line);
+    }
+    return s;
+}
+
+// SHA256 then RIPEMD160
+void hash160(const std::vector<unsigned char>& in, unsigned char out[20]) {
+    unsigned char sha[SHA256_DIGEST_LENGTH];
+    SHA256(in.data(), in.size(), sha);
+    RIPEMD160(sha, SHA256_DIGEST_LENGTH, out);
+}
+
+// In-place Base58Check encoder
+std::string base58Check(const std::vector<unsigned char>& data) {
+    // 1) append 4-byte checksum
+    std::vector<unsigned char> buf(data);
+    unsigned char sha1[SHA256_DIGEST_LENGTH], sha2[SHA256_DIGEST_LENGTH];
+    SHA256(buf.data(), buf.size(), sha1);
+    SHA256(sha1, SHA256_DIGEST_LENGTH, sha2);
+    buf.insert(buf.end(), sha2, sha2+4);
+
+    // 2) count leading zeros
+    size_t zeros = 0;
+    while (zeros < buf.size() && buf[zeros]==0) ++zeros;
+
+    // 3) convert to base58 digits
+    std::vector<unsigned char> temp(buf.begin(), buf.end());
     std::string result;
-
-    while (!BN_is_zero(bn)) {
-        BN_div(div, rem, bn, BN_value_one(), ctx);  // divide by 58
-        unsigned int index = BN_get_word(rem);
-        result = BASE58_ALPHABET[index % 58] + result;
-        BN_copy(bn, div);
+    result.reserve(buf.size()*138/100 + 1);
+    size_t start = zeros;
+    while (start < temp.size()) {
+        int carry = 0;
+        for (size_t i = start; i < temp.size(); ++i) {
+            int val = (carry << 8) + temp[i];
+            temp[i] = val / 58;
+            carry = val % 58;
+        }
+        result.push_back(BASE58_ALPHABET[carry]);
+        while (start<temp.size() && temp[start]==0) ++start;
     }
-
-    for (unsigned char c : input) {
-        if (c == 0x00) result = '1' + result;
-        else break;
-    }
-
-    BN_free(bn);
-    BN_free(div);
-    BN_free(rem);
-    BN_CTX_free(ctx);
+    // 4) leading zeros
+    for (size_t i=0; i<zeros; ++i) result.push_back('1');
+    // 5) reverse
+    std::reverse(result.begin(), result.end());
     return result;
 }
 
-std::string sha256(const std::string& input) {
-    unsigned char hash[SHA256_DIGEST_LENGTH];
-    SHA256((const unsigned char*)input.data(), input.size(), hash);
-    return std::string((char*)hash, SHA256_DIGEST_LENGTH);
+// Derive compressed and uncompressed addresses
+void derive_and_check(const std::vector<unsigned char>& priv,
+                      secp256k1_context* ctx,
+                      const std::unordered_set<std::string>& funded,
+                      std::ofstream& out) {
+    secp256k1_pubkey pub;
+    if (!secp256k1_ec_pubkey_create(ctx, &pub, priv.data())) return;
+
+    // serialize uncompressed
+    unsigned char uncmp[65]; size_t l1=65;
+    secp256k1_ec_pubkey_serialize(ctx, uncmp, &l1, &pub, SECP256K1_EC_UNCOMPRESSED);
+    std::vector<unsigned char> u1(uncmp, uncmp+l1);
+    unsigned char h160[20];
+    hash160(u1, h160);
+    std::vector<unsigned char> addr1 = {0x00};
+    addr1.insert(addr1.end(), h160, h160+20);
+    auto a1 = base58Check(addr1);
+
+    // compressed
+    unsigned char cmp[33]; size_t l2=33;
+    secp256k1_ec_pubkey_serialize(ctx, cmp, &l2, &pub, SECP256K1_EC_COMPRESSED);
+    std::vector<unsigned char> u2(cmp, cmp+l2);
+    hash160(u2, h160);
+    std::vector<unsigned char> addr2 = {0x00};
+    addr2.insert(addr2.end(), h160, h160+20);
+    auto a2 = base58Check(addr2);
+
+    // check
+    if (funded.count(a1)) {
+        std::lock_guard<std::mutex> g(file_mutex);
+        out << a1 << " PRIV:"; 
+        for (auto c:priv) out << std::hex << (int)(unsigned char)c;
+        out << "\n";
+    }
+    if (funded.count(a2)) {
+        std::lock_guard<std::mutex> g(file_mutex);
+        out << a2 << " PRIV:"; 
+        for (auto c:priv) out << std::hex << (int)(unsigned char)c;
+        out << "\n";
+    }
 }
 
-std::string ripemd160(const std::string& input) {
-    unsigned char hash[RIPEMD160_DIGEST_LENGTH];
-    RIPEMD160((const unsigned char*)input.data(), input.size(), hash);
-    return std::string((char*)hash, RIPEMD160_DIGEST_LENGTH);
-}
+// Worker thread function
+void worker(const std::unordered_set<std::string>& funded) {
+    // each thread gets its own RNG
+    XorShift64 rng(std::hash<std::thread::id>{}(std::this_thread::get_id()) ^ std::random_device{}());
+    secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
+    std::ofstream out("address.txt", std::ios::app);
 
-std::string publicKeyToAddress(const std::string& pubkey) {
-    std::string sha = sha256(pubkey);
-    std::string ripe = ripemd160(sha);
-    std::string prefixed = '\x00' + ripe;
-    std::string checksum = sha256(sha256(prefixed)).substr(0, 4);
-    return base58Encode(prefixed + checksum);
-}
+    std::vector<unsigned char> priv(32);
+    uint64_t local_count = 0;
 
-std::string generatePrivateKey() {
-    std::random_device rd;
-    std::uniform_int_distribution<unsigned long long> dist(0, UINT64_MAX);
-    std::string key(32, '\0');
-    for (int i = 0; i < 32; i += 8) {
-        uint64_t r = dist(rd);
-        for (int j = 0; j < 8; ++j) {
-            key[i + j] = static_cast<char>((r >> (8 * j)) & 0xff);
+    while (true) {
+        // generate 32 random bytes
+        for (int i = 0; i < 4; ++i) {
+            uint64_t r = rng.next();
+            for (int b = 0; b < 8; ++b)
+                priv[i*8 + b] = (r >> (8*b)) & 0xFF;
+        }
+        derive_and_check(priv, ctx, funded, out);
+
+        if (++local_count >= 1024) {
+            total_checked.fetch_add(local_count, std::memory_order_relaxed);
+            local_count = 0;
         }
     }
-    return key;
-}
-
-std::string privateKeyToPublicKey(const std::string& privkey, secp256k1_context* ctx) {
-    secp256k1_pubkey pubkey;
-    if (!secp256k1_ec_pubkey_create(ctx, &pubkey, (const unsigned char*)privkey.data())) {
-        return "";
-    }
-    unsigned char output[33];
-    size_t outputLen = 33;
-    secp256k1_ec_pubkey_serialize(ctx, output, &outputLen, &pubkey, SECP256K1_EC_COMPRESSED);
-    return std::string((char*)output, outputLen);
-}
-
-std::unordered_set<std::string> loadFundedAddresses(const std::string& filename) {
-    std::unordered_set<std::string> addresses;
-    std::ifstream file(filename);
-    std::string line;
-    while (std::getline(file, line)) {
-        line.erase(std::remove_if(line.begin(), line.end(), [](char c) {
-            return c == '\r' || c == '\n';
-        }), line.end());
-
-        if (!line.empty()) {
-            addresses.insert(line);
-        }
-    }
-    return addresses;
 }
 
 int main() {
-    secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
-    std::unordered_set<std::string> funded = loadFundedAddresses("/mnt/c/Users/jjmor/Downloads/bitcoin_addresses_latest.tsv");
-    std::ofstream outFile("address.txt", std::ios::app);
-    int count = 0;
+    auto funded = loadFunded("/mnt/c/Users/jjmor/Downloads/bitcoin_addresses_latest.tsv");
+    std::cout << "[+] Loaded funded addresses: " << funded.size() << "\n";
 
-    while (true) {
-        std::string privkey = generatePrivateKey();
-        std::string pubkey = privateKeyToPublicKey(privkey, ctx);
-        if (pubkey.empty()) continue;
-
-        std::string address = publicKeyToAddress(pubkey);
-
-        if (funded.find(address) != funded.end()) {
-            std::cout << "[FOUND] " << address << std::endl;
-            outFile << "Address: " << address << "\nPrivateKey (hex): ";
-            for (unsigned char c : privkey)
-                outFile << std::hex << (int)(unsigned char)c;
-            outFile << "\n\n";
-            outFile.flush();
+    // start progress reporter
+    std::thread reporter([](){
+        uint64_t prev = 0;
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            uint64_t now = total_checked.load();
+            std::cout << "[*] Checked " << now
+                      << " keys (+" << (now - prev) << "/s)\n";
+            prev = now;
         }
+    });
 
-        if (++count % 1000 == 0) {
-            std::cout << count << " keys checked...\n";
-        }
-    }
+    // start worker threads
+    unsigned int n = std::max(1u, std::thread::hardware_concurrency() - 1);
+    std::vector<std::thread> threads;
+    for (unsigned i = 0; i < n; ++i)
+        threads.emplace_back(worker, std::cref(funded));
 
-    secp256k1_context_destroy(ctx);
+    reporter.detach();
+    for (auto& t : threads) t.join();
     return 0;
 }
