@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -174,13 +175,27 @@ void worker(const std::unordered_set<std::string>& funded) {
 }
 
 int main(int argc, char** argv) {
-    // default to looking for TSV in CWD
-    std::string path = (argc > 1) ? argv[1] : "bitcoin_addresses_latest.tsv";
+    const std::string filename = "bitcoin_addresses_latest.tsv";
+    std::string path;
 
-    // if that path is a directory, assume the file is inside it with the same name
-    if (fs::is_directory(path)) {
-        std::string name = fs::path(path).filename().string();
-        path = path + "/" + name;
+    if (argc > 1) {
+        path = argv[1];
+    } else if (fs::exists(filename) && fs::is_regular_file(filename)) {
+        path = filename;
+    } else {
+        const char* home = std::getenv("HOME");
+        if (!home) {
+            std::cerr << "Error: HOME not set and no file in CWD\n";
+            return 1;
+        }
+        std::string homePath = std::string(home) + "/" + filename;
+        if (fs::exists(homePath) && fs::is_regular_file(homePath)) {
+            path = homePath;
+        } else {
+            std::cerr << "Error: cannot find " << filename
+                      << " in CWD or in $HOME\n";
+            return 1;
+        }
     }
 
     auto funded = loadFunded(path);
