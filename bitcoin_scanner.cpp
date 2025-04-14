@@ -12,6 +12,7 @@
 #include <openssl/ecdsa.h>
 #include <openssl/evp.h>
 #include <openssl/buffer.h>
+#include <algorithm>  // Include this for std::remove_if
 
 // Base58 encoding
 const char* BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
