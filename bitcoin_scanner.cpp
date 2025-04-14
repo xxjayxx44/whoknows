@@ -41,6 +41,7 @@ struct XorShift64 {
 
 // Progress counter
 std::atomic<uint64_t> total_checked{0};
+std::atomic<uint64_t> funded_loaded{0};
 std::mutex file_mutex;
 
 // Load lines from a gzipped TSV
@@ -91,6 +92,7 @@ std::unordered_set<std::string> loadFunded(const std::string& path) {
     } else {
         loadLinesTxt(path, s);
     }
+    funded_loaded.store(s.size(), std::memory_order_relaxed);
     return s;
 }
 
@@ -227,7 +229,7 @@ int main(int argc, char** argv) {
     }
 
     auto funded = loadFunded(path);
-    std::cout<<"[+] Loaded funded addresses: "<<funded.size()<<"\n";
+    std::cout<<"[+] Loaded funded addresses: "<<funded_loaded.load()<<"\n";
     if (funded.empty()) {
         std::cerr<<"No addresses loaded – check file format.\n";
         return 1;
@@ -235,12 +237,15 @@ int main(int argc, char** argv) {
 
     // progress reporter
     std::thread reporter([&](){
-        uint64_t prev = 0;
+        uint64_t prev_checked = 0;
+        uint64_t prev_funded = funded_loaded.load();
         while (true) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
-            uint64_t now = total_checked.load();
-            std::cout<<"[*] Checked "<<now<<" keys (+"<<(now-prev)<<"/s)\n";
-            prev = now;
+            uint64_t now_checked = total_checked.load();
+            std::cout<<"[*] Checked "<<now_checked<<" keys (+"<<(now_checked-prev_checked)<<"/s)\n";
+            std::cout<<"[+] Loaded funded addresses: "<<prev_funded<<"\n";
+            prev_checked = now_checked;
+            prev_funded = funded_loaded.load();
         }
     });
     reporter.detach();
