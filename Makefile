@@ -1,5 +1,3 @@
-# Makefile
-
 CXX       = g++
 CXXFLAGS  = -std=c++17 -O3 -march=native -Wall -Wextra
 LDLIBS    = -lsecp256k1 -lssl -lcrypto -lz
@@ -15,4 +13,4 @@ $(TARGET): $(SRC)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDLIBS)
 
 clean:
-	rm -f $(TARGET) address.txt
+	rm -f $(TARGET) addresses.txt
