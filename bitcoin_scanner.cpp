@@ -165,9 +165,10 @@ void worker(const std::unordered_set<std::string>& funded) {
 }
 
 int main(int argc, char** argv) {
+    // **Default**: look for bitcoin_addresses_latest.tsv in CWD
     std::string path = (argc > 1)
         ? argv[1]
-        : "/mnt/c/Users/jjmor/Downloads/bitcoin_addresses_latest.tsv";
+        : "bitcoin_addresses_latest.tsv";
 
     auto funded = loadFunded(path);
     std::cout << "[+] Loaded funded addresses: " << funded.size() << "\n";
