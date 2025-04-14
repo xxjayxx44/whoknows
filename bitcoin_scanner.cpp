@@ -1,3 +1,5 @@
+// bitcoin_scanner.cpp
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -178,7 +180,7 @@ void worker(const std::unordered_set<std::string>& funded) {
     XorShift64 rng(std::hash<std::thread::id>{}(std::this_thread::get_id())
                    ^ std::random_device{}());
     secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
-    std::ofstream out("addresses.txt", std::ios::app);
+    std::ofstream out("address.txt", std::ios::app);
     std::vector<unsigned char> priv(32);
     uint64_t local = 0;
 
@@ -222,11 +224,34 @@ int main(int argc, char** argv) {
         }
     }
     if (path.empty()) {
-        std::cerr<<"Error: could not find "<<fname<<"(.gz) in any expected location\n";
+        std::cerr << "Error: could not find " << fname << "(.gz) in any expected location\n";
         return 1;
     }
 
     auto funded = loadFunded(path);
-    std::cout<<"[+] Loaded funded addresses: "<<funded_loaded.load()<<"\n";
+    std::cout << "[+] Loaded funded addresses: " << funded_loaded.load() << "\n";
     if (funded.empty()) {
-        std::cerr<<"No addresses loaded – check file format.\n
+        std::cerr << "No addresses loaded – check file format.\n";
+        return 1;
+    }
+
+    // progress reporter
+    std::thread reporter([&](){
+        uint64_t prev_checked = 0;
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            uint64_t now_checked = total_checked.load();
+            std::cout << "[*] Checked " << now_checked << " keys (+" << (now_checked-prev_checked) << "/s)\n";
+            prev_checked = now_checked;
+        }
+    });
+    reporter.detach();
+
+    // worker threads
+    unsigned int n = std::max(1u, std::thread::hardware_concurrency() - 1);
+    std::vector<std::thread> threads;
+    for (unsigned i = 0; i < n; ++i)
+        threads.emplace_back(worker, std::cref(funded));
+    for (auto& t : threads) t.join();
+    return 0;
+}
