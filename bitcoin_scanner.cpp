@@ -41,7 +41,7 @@ struct XorShift64 {
 std::atomic<uint64_t> total_checked{0};
 std::atomic<uint64_t> funded_loaded{0};
 std::mutex file_mutex;
-constexpr size_t MAX_FUNDED_ADDRESSES = 100000;
+constexpr size_t MAX_FUNDED_ADDRESSES = 10;
 
 void loadLinesTxt(const std::string& path, std::unordered_set<std::string>& s) {
     std::ifstream in(path);
