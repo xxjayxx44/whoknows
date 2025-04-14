@@ -1,3 +1,5 @@
+# Makefile
+
 CXX       = g++
 CXXFLAGS  = -std=c++17 -O3 -march=native -Wall -Wextra
 LDLIBS    = -lsecp256k1 -lssl -lcrypto -lz
