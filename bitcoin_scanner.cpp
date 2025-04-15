@@ -26,25 +26,27 @@ namespace fs = std::filesystem;
 static const char* BASE58_ALPHABET =
     "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
-// XorShift64* RNG for speed
+// Tune this to your RAM/WSL constraints
+constexpr size_t MAX_FUNDED_ADDRESSES = 100000;
+
+// Fast XorShift64* RNG
 struct XorShift64 {
     uint64_t state;
     XorShift64(uint64_t seed)
         : state(seed ? seed : 0xdeadbeefcafebabeULL) {}
-    uint64_t next() {
+    inline uint64_t next() {
         uint64_t x = state;
         x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
-        state = x;
-        return x * 0x2545F4914F6CDD1DULL;
+        return state = x * 0x2545F4914F6CDD1DULL;
     }
 };
 
+// Atomic counters
 std::atomic<uint64_t> total_checked{0};
 std::atomic<uint64_t> funded_loaded{0};
 std::mutex file_mutex;
-constexpr size_t MAX_FUNDED_ADDRESSES = 50000;
 
-// load plain TSV, shuffle & pick first MAX_FUNDED_ADDRESSES
+// Load plain TSV, shuffle & pick first MAX_FUNDED_ADDRESSES
 void loadLinesTxt(const std::string& path, std::unordered_set<std::string>& s) {
     std::ifstream in(path);
     if (!in) { std::cerr<<"Error: cannot open "<<path<<"\n"; std::exit(1); }
@@ -53,10 +55,10 @@ void loadLinesTxt(const std::string& path, std::unordered_set<std::string>& s) {
     std::string line;
     while (std::getline(in, line)) {
         line.erase(std::remove_if(line.begin(), line.end(),
-            [](char c){ return c=='\r'||c=='\n'; }), line.end());
+            [](char c){ return c=='\r' || c=='\n'; }), line.end());
         if (line.empty()) continue;
         auto t = line.find('\t');
-        if (t!=std::string::npos) line.resize(t);
+        if (t != std::string::npos) line.resize(t);
         tmp.push_back(std::move(line));
     }
     std::shuffle(tmp.begin(), tmp.end(), std::mt19937{std::random_device{}()});
@@ -64,6 +66,7 @@ void loadLinesTxt(const std::string& path, std::unordered_set<std::string>& s) {
         s.insert(tmp[i]);
 }
 
+// Load funded addresses (TSV or TSV.GZ)
 std::unordered_set<std::string> loadFunded(const std::string& path) {
     std::unordered_set<std::string> s;
     s.reserve(MAX_FUNDED_ADDRESSES);
@@ -72,58 +75,63 @@ std::unordered_set<std::string> loadFunded(const std::string& path) {
         if (!gz) { std::cerr<<"Error opening "<<path<<"\n"; std::exit(1); }
         constexpr int BUF=1<<20; char buf[BUF];
         std::vector<std::string> tmp; tmp.reserve(MAX_FUNDED_ADDRESSES);
-        size_t cnt=0;
         while (gzgets(gz,buf,BUF)) {
             std::string line(buf);
-            line.erase(std::remove_if(line.begin(),line.end(),
-                [](char c){return c=='\r'||c=='\n';}),line.end());
+            line.erase(std::remove_if(line.begin(), line.end(),
+                [](char c){ return c=='\r' || c=='\n'; }), line.end());
             if (line.empty()) continue;
-            auto t=line.find('\t');
-            if (t!=std::string::npos) line.resize(t);
+            auto t = line.find('\t');
+            if (t != std::string::npos) line.resize(t);
             tmp.push_back(std::move(line));
         }
         gzclose(gz);
         std::shuffle(tmp.begin(), tmp.end(), std::mt19937{std::random_device{}()});
-        for (size_t i=0;i<tmp.size() && i<MAX_FUNDED_ADDRESSES;++i)
+        for (size_t i = 0; i < tmp.size() && i < MAX_FUNDED_ADDRESSES; ++i)
             s.insert(tmp[i]);
     } else {
-        loadLinesTxt(path,s);
+        loadLinesTxt(path, s);
     }
     funded_loaded.store(s.size(), std::memory_order_relaxed);
     return s;
 }
 
-void hash160(const std::vector<unsigned char>& in, unsigned char out[20]) {
+// SHA256 then RIPEMD160
+inline void hash160(const std::vector<unsigned char>& in, unsigned char out[20]) {
     unsigned char sha[SHA256_DIGEST_LENGTH];
-    SHA256(in.data(),in.size(),sha);
-    RIPEMD160(sha,SHA256_DIGEST_LENGTH,out);
+    SHA256(in.data(), in.size(), sha);
+    RIPEMD160(sha, SHA256_DIGEST_LENGTH, out);
 }
 
+// Base58Check (in-place)
 std::string base58Check(const std::vector<unsigned char>& data) {
     std::vector<unsigned char> buf = data;
     unsigned char sha1[SHA256_DIGEST_LENGTH], sha2[SHA256_DIGEST_LENGTH];
-    SHA256(buf.data(),buf.size(),sha1);
-    SHA256(sha1,SHA256_DIGEST_LENGTH,sha2);
-    buf.insert(buf.end(),sha2,sha2+4);
-    size_t zeros=0;
-    while(zeros<buf.size()&&buf[zeros]==0) ++zeros;
-    std::vector<unsigned char> temp(buf.begin(),buf.end());
-    std::string res; res.reserve(buf.size()*138/100+1);
-    size_t start=zeros;
-    while(start<temp.size()){
-        int carry=0;
-        for(size_t i=start;i<temp.size();++i){
-            int v=(carry<<8)+temp[i];
-            temp[i]=v/58; carry=v%58;
+    SHA256(buf.data(), buf.size(), sha1);
+    SHA256(sha1, SHA256_DIGEST_LENGTH, sha2);
+    buf.insert(buf.end(), sha2, sha2+4);
+
+    size_t zeros = 0;
+    while (zeros < buf.size() && buf[zeros]==0) ++zeros;
+
+    std::vector<unsigned char> temp(buf.begin(), buf.end());
+    std::string res; res.reserve(buf.size()*138/100 + 1);
+    size_t start = zeros;
+    while (start < temp.size()) {
+        int carry = 0;
+        for (size_t i = start; i < temp.size(); ++i) {
+            int v = (carry << 8) + temp[i];
+            temp[i] = v / 58;
+            carry = v % 58;
         }
         res.push_back(BASE58_ALPHABET[carry]);
-        while(start<temp.size()&&temp[start]==0) ++start;
+        while (start < temp.size() && temp[start]==0) ++start;
     }
-    for(size_t i=0;i<zeros;++i) res.push_back('1');
-    std::reverse(res.begin(),res.end());
+    for (size_t i = 0; i < zeros; ++i) res.push_back('1');
+    std::reverse(res.begin(), res.end());
     return res;
 }
 
+// Derive addresses, check, log matches
 void derive_and_check(
     const std::vector<unsigned char>& priv,
     secp256k1_context* ctx,
@@ -131,105 +139,114 @@ void derive_and_check(
     std::ofstream& out)
 {
     secp256k1_pubkey pub;
-    if(!secp256k1_ec_pubkey_create(ctx,&pub,priv.data())) return;
+    if (!secp256k1_ec_pubkey_create(ctx, &pub, priv.data())) return;
+
     // uncompressed
     unsigned char b1[65]; size_t l1=65;
-    secp256k1_ec_pubkey_serialize(ctx,b1,&l1,&pub,SECP256K1_EC_UNCOMPRESSED);
+    secp256k1_ec_pubkey_serialize(ctx, b1, &l1, &pub, SECP256K1_EC_UNCOMPRESSED);
     std::vector<unsigned char> v1(b1,b1+l1);
     unsigned char h1[20]; hash160(v1,h1);
     std::vector<unsigned char> a1={0x00}; a1.insert(a1.end(),h1,h1+20);
-    auto addr1=base58Check(a1);
+    auto addr1 = base58Check(a1);
+
     // compressed
     unsigned char b2[33]; size_t l2=33;
-    secp256k1_ec_pubkey_serialize(ctx,b2,&l2,&pub,SECP256K1_EC_COMPRESSED);
+    secp256k1_ec_pubkey_serialize(ctx, b2, &l2, &pub, SECP256K1_EC_COMPRESSED);
     std::vector<unsigned char> v2(b2,b2+l2);
     unsigned char h2[20]; hash160(v2,h2);
     std::vector<unsigned char> a2={0x00}; a2.insert(a2.end(),h2,h2+20);
-    auto addr2=base58Check(a2);
+    auto addr2 = base58Check(a2);
 
     std::lock_guard<std::mutex> g(file_mutex);
-    if(funded.count(addr1)){
+    if (funded.count(addr1)) {
         out<<addr1<<" PRIV:";
-        for(auto c:priv) out<<std::hex<<(int)c;
+        for (auto c:priv) out<<std::hex<<(int)c;
         out<<"\n";
     }
-    if(funded.count(addr2)){
+    if (funded.count(addr2)) {
         out<<addr2<<" PRIV:";
-        for(auto c:priv) out<<std::hex<<(int)c;
+        for (auto c:priv) out<<std::hex<<(int)c;
         out<<"\n";
     }
 }
 
+// Worker thread
 void worker(const std::unordered_set<std::string>& funded) {
     XorShift64 rng(std::hash<std::thread::id>{}(std::this_thread::get_id())
                    ^ std::random_device{}());
-    secp256k1_context* ctx=secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
-    std::ofstream out("address.txt",std::ios::app);
+    auto* ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
+    std::ofstream out("addresses.txt", std::ios::app);
     std::vector<unsigned char> priv(32);
-    uint64_t local=0;
-    while(true){
-        for(int i=0;i<4;i++){
-            uint64_t r=rng.next();
-            for(int b=0;b<8;b++)
-                priv[i*8+b]=(r>>(8*b))&0xFF;
+    uint64_t local = 0;
+
+    while (true) {
+        for (int i = 0; i < 4; ++i) {
+            uint64_t r = rng.next();
+            for (int b = 0; b < 8; ++b)
+                priv[i*8 + b] = (r >> (8*b)) & 0xFF;
         }
-        derive_and_check(priv,ctx,funded,out);
-        if(++local>=1024){
-            total_checked.fetch_add(local,std::memory_order_relaxed);
-            local=0;
+        derive_and_check(priv, ctx, funded, out);
+        if (++local >= 1024) {
+            total_checked.fetch_add(local, std::memory_order_relaxed);
+            local = 0;
         }
     }
 }
 
-int main(int argc,char**argv){
+int main(int argc, char** argv) {
     std::ios::sync_with_stdio(false);
     std::cin.tie(nullptr);
 
-    const std::string fname="bitcoin_addresses_latest.tsv";
+    const std::string fname = "bitcoin_addresses_latest.tsv";
     std::vector<std::string> cands;
-    if(argc>1) cands.push_back(argv[1]);
+    if (argc>1) cands.push_back(argv[1]);
     cands.push_back(fname);
-    cands.push_back(fname+".gz");
-    cands.push_back("/mnt/c/Users/jjmor/Downloads/"+fname);
-    cands.push_back("/mnt/c/Users/jjmor/Downloads/"+fname+".gz");
-    if(const char* h=getenv("HOME")){
-        cands.push_back(std::string(h)+"/"+fname);
-        cands.push_back(std::string(h)+"/"+fname+".gz");
+    cands.push_back(fname + ".gz");
+    cands.push_back("/mnt/c/Users/jjmor/Downloads/" + fname);
+    cands.push_back("/mnt/c/Users/jjmor/Downloads/" + fname + ".gz");
+    if (auto* h = std::getenv("HOME")) {
+        cands.push_back(std::string(h) + "/" + fname);
+        cands.push_back(std::string(h) + "/" + fname + ".gz");
     }
 
     std::string path;
-    for(auto&p:cands){
-        if(fs::exists(p)&&fs::is_regular_file(p)){path=p;break;}
+    for (auto& p : cands) {
+        if (fs::exists(p) && fs::is_regular_file(p)) {
+            path = p;
+            break;
+        }
     }
-    if(path.empty()){
+    if (path.empty()) {
         std::cerr<<"Error: cannot find "<<fname<<"(.gz)\n";
         return 1;
     }
 
     std::cout<<"[*] Loading funded addresses...\n";
-    auto funded=loadFunded(path);
+    auto funded = loadFunded(path);
     std::cout<<"[+] Loaded funded addresses: "<<funded_loaded.load()<<"\n";
-    if(funded.empty()){
+    if (funded.empty()) {
         std::cerr<<"No addresses loaded - check file format.\n";
         return 1;
     }
 
-    // progress reporter
+    // Progress reporter
     std::thread reporter([&](){
-        uint64_t prev=0;
-        while(true){
+        uint64_t prev = 0;
+        while (true) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
-            uint64_t now=total_checked.load();
+            uint64_t now = total_checked.load();
             std::cout<<"[*] Checked "<<now<<" keys (+"<<(now-prev)<<"/s)\n";
-            prev=now;
+            prev = now;
         }
     });
     reporter.detach();
 
-    unsigned int n=std::max(1u,std::thread::hardware_concurrency()-1);
+    // Worker threads
+    unsigned int n = std::max(1u, std::thread::hardware_concurrency() - 1);
     std::vector<std::thread> threads;
-    for(unsigned i=0;i<n;++i)
-        threads.emplace_back(worker,std::cref(funded));
-    for(auto& t:threads) t.join();
+    for (unsigned i = 0; i < n; ++i)
+        threads.emplace_back(worker, std::cref(funded));
+    for (auto& t : threads) t.join();
+
     return 0;
 }
