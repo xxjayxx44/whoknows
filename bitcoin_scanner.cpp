@@ -20,7 +20,7 @@
 
 #include <zlib.h>
 #include <openssl/sha.h>
-#include <openssl/ripemd.h>
+#include <openssl/evp.h>
 #include <openssl/bn.h>
 #include <openssl/rand.h>
 #include <secp256k1.h>
@@ -71,7 +71,8 @@ std::vector<unsigned char> decodeBase58Check(const std::string& addr) {
     BN_zero(bn);
 
     for (char c : addr) {
-        int8_t v = (c < 0 || c > 127) ? -1 : B58_MAP[(uint8_t)c];
+        uint8_t uc = static_cast<uint8_t>(c);
+        int8_t v = B58_MAP[uc];
         if (v < 0) { BN_free(bn); BN_CTX_free(ctx); return {}; }
         BN_mul_word(bn, 58);
         BN_add_word(bn, v);
@@ -107,7 +108,6 @@ std::vector<unsigned char> decodeBase58Check(const std::string& addr) {
     SHA256(hash1, SHA256_DIGEST_LENGTH, hash2);
     if (memcmp(hash2, result.data() + len - 4, 4) != 0) return {};
 
-    // Return the payload: version + data (we include version for completeness)
     return result;
 }
 
@@ -164,7 +164,6 @@ void reservoirSampleGz(const std::string& path, std::vector<std::string>& reserv
 
 // Load funded addresses into a set of raw 20-byte hash160 payloads
 std::unordered_set<std::array<unsigned char, 20>> loadFunded(const std::string& path) {
-    // 1) Reservoir sample the addresses as strings
     std::vector<std::string> reservoir;
     reservoir.reserve(MAX_FUNDED_ADDRESSES);
     if (path.size()>3 && path.substr(path.size()-3)==".gz")
@@ -172,7 +171,6 @@ std::unordered_set<std::array<unsigned char, 20>> loadFunded(const std::string& 
     else
         reservoirSampleTxt(path, reservoir);
 
-    // 2) Decode each to raw bytes and extract hash160
     std::unordered_set<std::array<unsigned char, 20>> s;
     s.reserve(reservoir.size());
     for (auto& addr : reservoir) {
@@ -187,11 +185,16 @@ std::unordered_set<std::array<unsigned char, 20>> loadFunded(const std::string& 
     return s;
 }
 
-// SHA256→RIPEMD160
+// SHA256→RIPEMD160 using modern EVP interface
 inline void hash160(const std::vector<unsigned char>& in, unsigned char out[20]) {
     unsigned char sha[SHA256_DIGEST_LENGTH];
     SHA256(in.data(), in.size(), sha);
-    RIPEMD160(sha, SHA256_DIGEST_LENGTH, out);
+    
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    EVP_DigestInit_ex(ctx, EVP_ripemd160(), nullptr);
+    EVP_DigestUpdate(ctx, sha, SHA256_DIGEST_LENGTH);
+    EVP_DigestFinal_ex(ctx, out, nullptr);
+    EVP_MD_CTX_free(ctx);
 }
 
 // Base58Check encode (for logging only)
@@ -202,11 +205,9 @@ std::string base58CheckEncode(const std::vector<unsigned char>& data) {
     SHA256(sha1, SHA256_DIGEST_LENGTH, sha2);
     buf.insert(buf.end(), sha2, sha2+4);
 
-    // Leading zeros
     size_t zeros = 0;
     while (zeros < buf.size() && buf[zeros]==0) ++zeros;
 
-    // Convert
     std::vector<unsigned char> temp(buf.begin(), buf.end());
     std::string res; res.reserve(buf.size()*138/100 + 1);
     size_t start = zeros;
@@ -251,23 +252,30 @@ void derive_and_check(
     std::array<unsigned char, 20> key2;
     memcpy(key2.data(), h2, 20);
 
-    // Check
+    // Check matches
     if (funded.count(key1) || funded.count(key2)) {
         std::lock_guard<std::mutex> g(file_mutex);
-        // Log both pubkey forms
+        
         if (funded.count(key1)) {
-            auto addr = base58CheckEncode({0x00, h1, h1+20});
+            std::vector<unsigned char> data{0x00};
+            data.insert(data.end(), h1, h1+20);
+            auto addr = base58CheckEncode(data);
             out << addr << " PRIV:";
             for (auto c : priv) {
-                out << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(c);
+                out << std::hex << std::setw(2) << std::setfill('0') 
+                    << static_cast<int>(c);
             }
             out << "\n";
         }
+        
         if (funded.count(key2)) {
-            auto addr = base58CheckEncode({0x00, h2, h2+20});
+            std::vector<unsigned char> data{0x00};
+            data.insert(data.end(), h2, h2+20);
+            auto addr = base58CheckEncode(data);
             out << addr << " PRIV:";
             for (auto c : priv) {
-                out << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(c);
+                out << std::hex << std::setw(2) << std::setfill('0') 
+                    << static_cast<int>(c);
             }
             out << "\n";
         }
@@ -282,13 +290,11 @@ void worker(const std::unordered_set<std::array<unsigned char, 20>>& funded) {
     uint64_t local = 0;
 
     while (true) {
-        // Generate valid private key using cryptographically secure RNG
         if (RAND_bytes(priv.data(), priv.size()) != 1) {
             std::cerr << "Error generating random bytes\n";
             break;
         }
 
-        // Ensure private key is within curve order
         secp256k1_pubkey pub;
         if (secp256k1_ec_pubkey_create(ctx, &pub, priv.data())) {
             derive_and_check(priv, ctx, funded, out);
