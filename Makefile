@@ -13,4 +13,4 @@ $(TARGET): $(SRC)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDLIBS)
 
 clean:
-	rm -f $(TARGET) address.txt
+	rm -f $(TARGET) addresses.txt
