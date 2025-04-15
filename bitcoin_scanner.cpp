@@ -34,7 +34,7 @@ namespace std {
         size_t operator()(const std::array<unsigned char, 20>& arr) const noexcept {
             size_t h = 0;
             for (auto b : arr) {
-                h ^= hash<unsigned char>{}(b) + 0x9e3779b9 + (h << 6) + (h >> 2);
+                h ^= std::hash<unsigned char>{}(b) + 0x9e3779b9 + (h << 6) + (h >> 2);
             }
             return h;
         }
@@ -56,15 +56,17 @@ struct _InitB58 {
     }
 } _initB58;
 
-// Limits
+// Configuration
 constexpr size_t MAX_FUNDED_ADDRESSES = 100000;
+constexpr size_t PRIV_BATCH_SIZE = 1024;
+constexpr size_t ALIGNMENT = 64;
 
 // Progress counters
-std::atomic<uint64_t> total_checked{0};
-std::atomic<uint64_t> funded_loaded{0};
+alignas(ALIGNMENT) std::atomic<uint64_t> total_checked{0};
+alignas(ALIGNMENT) std::atomic<uint64_t> funded_loaded{0};
 std::mutex file_mutex;
 
-// Decode Base58Check into raw bytes; returns empty vector on error
+// Optimized Base58 decoder
 std::vector<unsigned char> decodeBase58Check(const std::string& addr) {
     BN_CTX* ctx = BN_CTX_new();
     BIGNUM* bn = BN_new();
@@ -78,19 +80,16 @@ std::vector<unsigned char> decodeBase58Check(const std::string& addr) {
         BN_add_word(bn, v);
     }
 
-    // Convert BN to binary
     int num_bytes = BN_num_bytes(bn);
     std::vector<unsigned char> bin(num_bytes);
     BN_bn2bin(bn, bin.data());
 
-    // Count leading '1's for leading zero bytes
     size_t zeros = 0;
     for (char c : addr) {
         if (c == '1') zeros++;
         else break;
     }
 
-    // Prepend zeros
     std::vector<unsigned char> result(zeros + bin.size());
     std::fill(result.begin(), result.begin() + zeros, 0);
     std::copy(bin.begin(), bin.end(), result.begin() + zeros);
@@ -98,20 +97,17 @@ std::vector<unsigned char> decodeBase58Check(const std::string& addr) {
     BN_free(bn);
     BN_CTX_free(ctx);
 
-    // Must be at least version(1)+payload(20)+checksum(4)=25 bytes
     if (result.size() < 25) return {};
 
-    // Verify checksum
-    size_t len = result.size();
     unsigned char hash1[SHA256_DIGEST_LENGTH], hash2[SHA256_DIGEST_LENGTH];
-    SHA256(result.data(), len - 4, hash1);
+    SHA256(result.data(), result.size() - 4, hash1);
     SHA256(hash1, SHA256_DIGEST_LENGTH, hash2);
-    if (memcmp(hash2, result.data() + len - 4, 4) != 0) return {};
-
-    return result;
+    
+    if (memcmp(hash2, result.data() + result.size() - 4, 4) != 0) return {};
+    return {result.begin(), result.end() - 4};
 }
 
-// Reservoir sampling from a plain TSV
+// Reservoir sampling from plain TSV
 void reservoirSampleTxt(const std::string& path, std::vector<std::string>& reservoir) {
     std::ifstream in(path);
     if (!in) { std::cerr<<"Error: cannot open "<<path<<"\n"; std::exit(1); }
@@ -135,7 +131,7 @@ void reservoirSampleTxt(const std::string& path, std::vector<std::string>& reser
     }
 }
 
-// Reservoir sampling from a gzipped TSV
+// Reservoir sampling from gzipped TSV
 void reservoirSampleGz(const std::string& path, std::vector<std::string>& reservoir) {
     gzFile gz = gzopen(path.c_str(), "rb");
     if (!gz) { std::cerr<<"Error: cannot open gz file: "<<path<<"\n"; std::exit(1); }
@@ -162,7 +158,7 @@ void reservoirSampleGz(const std::string& path, std::vector<std::string>& reserv
     gzclose(gz);
 }
 
-// Load funded addresses into a set of raw 20-byte hash160 payloads
+// Load funded addresses
 std::unordered_set<std::array<unsigned char, 20>> loadFunded(const std::string& path) {
     std::vector<std::string> reservoir;
     reservoir.reserve(MAX_FUNDED_ADDRESSES);
@@ -185,7 +181,7 @@ std::unordered_set<std::array<unsigned char, 20>> loadFunded(const std::string& 
     return s;
 }
 
-// SHA256→RIPEMD160 using modern EVP interface
+// Optimized hash160 using EVP
 inline void hash160(const std::vector<unsigned char>& in, unsigned char out[20]) {
     unsigned char sha[SHA256_DIGEST_LENGTH];
     SHA256(in.data(), in.size(), sha);
@@ -197,7 +193,7 @@ inline void hash160(const std::vector<unsigned char>& in, unsigned char out[20])
     EVP_MD_CTX_free(ctx);
 }
 
-// Base58Check encode (for logging only)
+// Base58Check encode
 std::string base58CheckEncode(const std::vector<unsigned char>& data) {
     std::vector<unsigned char> buf = data;
     unsigned char sha1[SHA256_DIGEST_LENGTH], sha2[SHA256_DIGEST_LENGTH];
@@ -226,84 +222,79 @@ std::string base58CheckEncode(const std::vector<unsigned char>& data) {
     return res;
 }
 
-// Derive addresses, check raw hash160, log matches
-void derive_and_check(
-    const std::vector<unsigned char>& priv,
+// Batch processing function
+void derive_and_check_batch(
+    const std::vector<unsigned char>& priv_batch,
     secp256k1_context* ctx,
     const std::unordered_set<std::array<unsigned char, 20>>& funded,
     std::ofstream& out)
 {
-    secp256k1_pubkey pub;
-    if (!secp256k1_ec_pubkey_create(ctx, &pub, priv.data())) return;
-
-    // Uncompressed
-    unsigned char buf1[65]; size_t l1=65;
-    secp256k1_ec_pubkey_serialize(ctx, buf1, &l1, &pub, SECP256K1_EC_UNCOMPRESSED);
-    std::vector<unsigned char> v1(buf1, buf1+l1);
-    unsigned char h1[20]; hash160(v1, h1);
-    std::array<unsigned char, 20> key1;
-    memcpy(key1.data(), h1, 20);
-
-    // Compressed
-    unsigned char buf2[33]; size_t l2=33;
-    secp256k1_ec_pubkey_serialize(ctx, buf2, &l2, &pub, SECP256K1_EC_COMPRESSED);
-    std::vector<unsigned char> v2(buf2, buf2+l2);
-    unsigned char h2[20]; hash160(v2, h2);
-    std::array<unsigned char, 20> key2;
-    memcpy(key2.data(), h2, 20);
-
-    // Check matches
-    if (funded.count(key1) || funded.count(key2)) {
-        std::lock_guard<std::mutex> g(file_mutex);
+    const size_t batch_size = priv_batch.size() / 32;
+    
+    #pragma omp parallel for
+    for (size_t i = 0; i < batch_size; ++i) {
+        const unsigned char* priv = priv_batch.data() + i * 32;
+        secp256k1_pubkey pub;
         
-        if (funded.count(key1)) {
-            std::vector<unsigned char> data{0x00};
-            data.insert(data.end(), h1, h1+20);
-            auto addr = base58CheckEncode(data);
-            out << addr << " PRIV:";
-            for (auto c : priv) {
-                out << std::hex << std::setw(2) << std::setfill('0') 
-                    << static_cast<int>(c);
-            }
-            out << "\n";
-        }
+        if (!secp256k1_ec_pubkey_create(ctx, &pub, priv)) continue;
+
+        unsigned char buf1[65], buf2[33];
+        size_t len1 = 65, len2 = 33;
         
-        if (funded.count(key2)) {
-            std::vector<unsigned char> data{0x00};
-            data.insert(data.end(), h2, h2+20);
-            auto addr = base58CheckEncode(data);
-            out << addr << " PRIV:";
-            for (auto c : priv) {
-                out << std::hex << std::setw(2) << std::setfill('0') 
-                    << static_cast<int>(c);
+        secp256k1_ec_pubkey_serialize(ctx, buf1, &len1, &pub, SECP256K1_EC_UNCOMPRESSED);
+        secp256k1_ec_pubkey_serialize(ctx, buf2, &len2, &pub, SECP256K1_EC_COMPRESSED);
+
+        unsigned char h1[20], h2[20];
+        hash160(std::vector<unsigned char>(buf1, buf1+len1), h1);
+        hash160(std::vector<unsigned char>(buf2, buf2+len2), h2);
+
+        std::array<unsigned char, 20> key1, key2;
+        memcpy(key1.data(), h1, 20);
+        memcpy(key2.data(), h2, 20);
+
+        if (funded.count(key1) || funded.count(key2)) {
+            std::lock_guard<std::mutex> lock(file_mutex);
+            if (funded.count(key1)) {
+                std::vector<unsigned char> data{0x00};
+                data.insert(data.end(), h1, h1+20);
+                out << base58CheckEncode(data) << " PRIV:";
+                for (int j = 0; j < 32; ++j) 
+                    out << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(priv[j]);
+                out << "\n";
             }
-            out << "\n";
+            if (funded.count(key2)) {
+                std::vector<unsigned char> data{0x00};
+                data.insert(data.end(), h2, h2+20);
+                out << base58CheckEncode(data) << " PRIV:";
+                for (int j = 0; j < 32; ++j) 
+                    out << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(priv[j]);
+                out << "\n";
+            }
         }
     }
 }
 
-// Worker thread
+// Optimized worker thread
 void worker(const std::unordered_set<std::array<unsigned char, 20>>& funded) {
-    auto* ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
+    secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
     std::ofstream out("addresses.txt", std::ios::app);
-    std::vector<unsigned char> priv(32);
-    uint64_t local = 0;
+    alignas(ALIGNMENT) std::vector<unsigned char> priv_batch(PRIV_BATCH_SIZE * 32);
+
+    #ifdef __linux__
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(0, &cpuset);
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+    #endif
 
     while (true) {
-        if (RAND_bytes(priv.data(), priv.size()) != 1) {
-            std::cerr << "Error generating random bytes\n";
+        if (RAND_bytes(priv_batch.data(), priv_batch.size()) != 1) {
+            std::cerr << "RAND_bytes failed\n";
             break;
         }
 
-        secp256k1_pubkey pub;
-        if (secp256k1_ec_pubkey_create(ctx, &pub, priv.data())) {
-            derive_and_check(priv, ctx, funded, out);
-        }
-
-        if (++local >= 1024) {
-            total_checked.fetch_add(local, std::memory_order_relaxed);
-            local = 0;
-        }
+        derive_and_check_batch(priv_batch, ctx, funded, out);
+        total_checked.fetch_add(PRIV_BATCH_SIZE, std::memory_order_relaxed);
     }
 }
 
@@ -311,7 +302,7 @@ int main(int argc, char** argv) {
     std::ios::sync_with_stdio(false);
     std::cin.tie(nullptr);
 
-    // Initialize OpenSSL RNG
+    // Initialize RNG
     if (RAND_status() != 1) {
         std::vector<unsigned char> seed(256);
         std::ifstream urandom("/dev/urandom", std::ios::binary);
@@ -323,13 +314,16 @@ int main(int argc, char** argv) {
         RAND_seed(seed.data(), seed.size());
     }
 
+    // Find input file
     const std::string fname = "bitcoin_addresses_latest.tsv";
     std::vector<std::string> candidates;
-    if (argc>1) candidates.push_back(argv[1]);
-    candidates.push_back(fname);
-    candidates.push_back(fname + ".gz");
-    candidates.push_back("/mnt/c/Users/jjmor/Downloads/" + fname);
-    candidates.push_back("/mnt/c/Users/jjmor/Downloads/" + fname + ".gz");
+    if (argc > 1) candidates.push_back(argv[1]);
+    candidates.insert(candidates.end(), {
+        fname, fname + ".gz",
+        "/mnt/c/Users/jjmor/Downloads/" + fname,
+        "/mnt/c/Users/jjmor/Downloads/" + fname + ".gz"
+    });
+    
     if (auto* h = std::getenv("HOME")) {
         candidates.push_back(std::string(h) + "/" + fname);
         candidates.push_back(std::string(h) + "/" + fname + ".gz");
@@ -344,6 +338,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Load funded addresses
     std::cout << "[*] Loading funded addresses...\n";
     auto funded = loadFunded(path);
     std::cout << "[+] Loaded funded addresses: " << funded_loaded.load() << "\n";
@@ -352,7 +347,13 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Progress reporter
+    // Start workers
+    unsigned int n = std::max(1u, std::thread::hardware_concurrency() - 1);
+    std::vector<std::thread> threads;
+    for (unsigned i = 0; i < n; ++i)
+        threads.emplace_back(worker, std::cref(funded));
+
+    // Progress reporting
     std::thread reporter([&](){
         uint64_t prev = 0;
         while (true) {
@@ -364,12 +365,6 @@ int main(int argc, char** argv) {
     });
     reporter.detach();
 
-    // Workers
-    unsigned int n = std::max(1u, std::thread::hardware_concurrency() - 1);
-    std::vector<std::thread> threads;
-    for (unsigned i = 0; i < n; ++i)
-        threads.emplace_back(worker, std::cref(funded));
     for (auto& t : threads) t.join();
-
     return 0;
 }
