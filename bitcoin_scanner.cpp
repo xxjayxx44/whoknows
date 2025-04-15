@@ -24,6 +24,22 @@
 
 namespace fs = std::filesystem;
 
+// Provide a hash function for std::array<unsigned char,20>
+namespace std {
+    template<>
+    struct hash<array<unsigned char,20>> {
+        size_t operator()(array<unsigned char,20> const& a) const noexcept {
+            // FNV-1a 64-bit
+            uint64_t h = 146527;
+            for (auto c : a) {
+                h ^= c;
+                h *= 1099511628211ull;
+            }
+            return (size_t)h;
+        }
+    };
+}
+
 // Base58 alphabet
 static const char* BASE58_ALPHABET =
     "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
@@ -32,16 +48,28 @@ static const char* BASE58_ALPHABET =
 constexpr size_t MAX_FUNDED_ADDRESSES = 100000;
 
 // Progress counters
-std::atomic<uint64_t> total_checked{0};
-std::atomic<uint64_t> funded_loaded{0};
-std::mutex file_mutex;
+static std::atomic<uint64_t> total_checked{0};
+static std::atomic<uint64_t> funded_loaded{0};
+static std::mutex file_mutex;
 
-// Decode Base58 into bytes (big integer)
+// Fast XorShift64* RNG
+struct XorShift64 {
+    uint64_t state;
+    XorShift64(uint64_t seed)
+        : state(seed ? seed : 0xdeadbeefcafebabeULL) {}
+    inline uint64_t next() {
+        uint64_t x = state;
+        x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
+        return state = x * 0x2545F4914F6CDD1DULL;
+    }
+};
+
+// Decode Base58 into bytes (little-endian)
 bool base58Decode(const std::string& str, std::vector<unsigned char>& out) {
     std::vector<unsigned char> b256;
     b256.reserve(str.size());
     for (char c : str) {
-        const char* p = strchr(BASE58_ALPHABET, c);
+        const char* p = std::strchr(BASE58_ALPHABET, c);
         if (!p) return false;
         int digit = p - BASE58_ALPHABET;
         int carry = digit;
@@ -55,35 +83,32 @@ bool base58Decode(const std::string& str, std::vector<unsigned char>& out) {
             carry >>= 8;
         }
     }
-    // count leading zeros
     size_t zeros = 0;
     for (char c : str) {
         if (c == '1') zeros++;
         else break;
     }
     out.assign(zeros, 0x00);
-    // convert little-endian b256 to big-endian
     for (auto it = b256.rbegin(); it != b256.rend(); ++it) {
         out.push_back(*it);
     }
     return true;
 }
 
-// Decode Base58Check, strip version+checksum, return payload
+// Decode Base58Check, strip version & checksum, return 20-byte payload
 bool decodeBase58Check(const std::string& str, std::vector<unsigned char>& payload) {
     std::vector<unsigned char> full;
     if (!base58Decode(str, full) || full.size() < 5) return false;
     size_t plen = full.size() - 5;
-    unsigned char version = full[0];
+    // version = full[0];  // we don't need it
     payload.assign(full.begin() + 1, full.begin() + 1 + plen);
-    // verify checksum
     unsigned char hash1[SHA256_DIGEST_LENGTH], hash2[SHA256_DIGEST_LENGTH];
     SHA256(full.data(), 1 + plen, hash1);
     SHA256(hash1, SHA256_DIGEST_LENGTH, hash2);
-    return memcmp(hash2, full.data() + 1 + plen, 4) == 0;
+    return std::memcmp(hash2, full.data() + 1 + plen, 4) == 0;
 }
 
-// Load addresses (TSV or TSV.GZ), decode to raw hash160, sample up to MAX_FUNDED_ADDRESSES
+// Load addresses (TSV or TSV.GZ), decode to raw 20-byte hash160, sample up to MAX_FUNDED_ADDRESSES
 std::unordered_set<std::array<unsigned char,20>> loadFunded(const std::string& path) {
     std::vector<std::string> lines;
     lines.reserve(MAX_FUNDED_ADDRESSES * 2);
@@ -115,17 +140,18 @@ std::unordered_set<std::array<unsigned char,20>> loadFunded(const std::string& p
             lines.push_back(std::move(line));
         }
     }
-    // shuffle & sample
+
     std::shuffle(lines.begin(), lines.end(), std::mt19937{std::random_device{}()});
     std::unordered_set<std::array<unsigned char,20>> s;
     s.reserve(MAX_FUNDED_ADDRESSES);
+
     size_t count = 0;
     for (auto& addr : lines) {
         if (count++ >= MAX_FUNDED_ADDRESSES) break;
         std::vector<unsigned char> payload;
         if (!decodeBase58Check(addr, payload) || payload.size() != 20) continue;
         std::array<unsigned char,20> arr;
-        memcpy(arr.data(), payload.data(), 20);
+        std::memcpy(arr.data(), payload.data(), 20);
         s.insert(arr);
     }
     funded_loaded.store(s.size(), std::memory_order_relaxed);
@@ -183,11 +209,12 @@ void derive_and_check(
     secp256k1_ec_pubkey_serialize(ctx, buf, &len, &pub, SECP256K1_EC_UNCOMPRESSED);
     unsigned char h160[20];
     hash160(buf, len, h160);
+
     std::array<unsigned char,20> key;
-    memcpy(key.data(), h160, 20);
+    std::memcpy(key.data(), h160, 20);
 
     if (funded.count(key)) {
-        // only now do Base58Check encode for logging
+        // Only now do Base58Check for logging
         std::vector<unsigned char> data = {0x00};
         data.insert(data.end(), h160, h160+20);
         std::string addr = base58Check(data);
@@ -246,15 +273,15 @@ int main(int argc, char** argv) {
         }
     }
     if (path.empty()) {
-        std::cerr<<"Error: cannot find "<<fname<<"(.gz)\n";
+        std::cerr << "Error: cannot find " << fname << "(.gz)\n";
         return 1;
     }
 
-    std::cout<<"[*] Loading funded addresses...\n";
+    std::cout << "[*] Loading funded addresses...\n";
     auto funded = loadFunded(path);
-    std::cout<<"[+] Loaded funded addresses: "<<funded_loaded.load()<<"\n";
+    std::cout << "[+] Loaded funded addresses: " << funded_loaded.load() << "\n";
     if (funded.empty()) {
-        std::cerr<<"No addresses loaded - check file format.\n";
+        std::cerr << "No addresses loaded - check file format.\n";
         return 1;
     }
 
@@ -264,7 +291,8 @@ int main(int argc, char** argv) {
         while (true) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             uint64_t now = total_checked.load();
-            std::cout<<"[*] Checked "<<now<<" keys (+"<<(now-prev)<<"/s)\n";
+            std::cout << "[*] Checked " << now
+                      << " keys (+" << (now-prev) << "/s)\n";
             prev = now;
         }
     });
