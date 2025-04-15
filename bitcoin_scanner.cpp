@@ -1,6 +1,7 @@
 // bitcoin_scanner.cpp
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -25,6 +26,20 @@
 #include <secp256k1.h>
 
 namespace fs = std::filesystem;
+
+// Custom hash specialization for std::array<unsigned char, 20>
+namespace std {
+    template<>
+    struct hash<std::array<unsigned char, 20>> {
+        size_t operator()(const std::array<unsigned char, 20>& arr) const noexcept {
+            size_t h = 0;
+            for (auto b : arr) {
+                h ^= hash<unsigned char>{}(b) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            }
+            return h;
+        }
+    };
+}
 
 // Base58 alphabet for encoding
 static const char* BASE58_ALPHABET =
@@ -148,7 +163,7 @@ void reservoirSampleGz(const std::string& path, std::vector<std::string>& reserv
 }
 
 // Load funded addresses into a set of raw 20-byte hash160 payloads
-std::unordered_set<std::array<uint8_t,20>> loadFunded(const std::string& path) {
+std::unordered_set<std::array<unsigned char, 20>> loadFunded(const std::string& path) {
     // 1) Reservoir sample the addresses as strings
     std::vector<std::string> reservoir;
     reservoir.reserve(MAX_FUNDED_ADDRESSES);
@@ -158,12 +173,12 @@ std::unordered_set<std::array<uint8_t,20>> loadFunded(const std::string& path) {
         reservoirSampleTxt(path, reservoir);
 
     // 2) Decode each to raw bytes and extract hash160
-    std::unordered_set<std::array<uint8_t,20>> s;
+    std::unordered_set<std::array<unsigned char, 20>> s;
     s.reserve(reservoir.size());
     for (auto& addr : reservoir) {
         auto raw = decodeBase58Check(addr);
         if (raw.size() >= 21 && raw[0] == 0x00) {
-            std::array<uint8_t,20> h;
+            std::array<unsigned char, 20> h;
             memcpy(h.data(), raw.data()+1, 20);
             s.insert(h);
         }
@@ -214,7 +229,7 @@ std::string base58CheckEncode(const std::vector<unsigned char>& data) {
 void derive_and_check(
     const std::vector<unsigned char>& priv,
     secp256k1_context* ctx,
-    const std::unordered_set<std::array<uint8_t,20>>& funded,
+    const std::unordered_set<std::array<unsigned char, 20>>& funded,
     std::ofstream& out)
 {
     secp256k1_pubkey pub;
@@ -225,7 +240,7 @@ void derive_and_check(
     secp256k1_ec_pubkey_serialize(ctx, buf1, &l1, &pub, SECP256K1_EC_UNCOMPRESSED);
     std::vector<unsigned char> v1(buf1, buf1+l1);
     unsigned char h1[20]; hash160(v1, h1);
-    std::array<uint8_t,20> key1;
+    std::array<unsigned char, 20> key1;
     memcpy(key1.data(), h1, 20);
 
     // Compressed
@@ -233,7 +248,7 @@ void derive_and_check(
     secp256k1_ec_pubkey_serialize(ctx, buf2, &l2, &pub, SECP256K1_EC_COMPRESSED);
     std::vector<unsigned char> v2(buf2, buf2+l2);
     unsigned char h2[20]; hash160(v2, h2);
-    std::array<uint8_t,20> key2;
+    std::array<unsigned char, 20> key2;
     memcpy(key2.data(), h2, 20);
 
     // Check
@@ -260,7 +275,7 @@ void derive_and_check(
 }
 
 // Worker thread
-void worker(const std::unordered_set<std::array<uint8_t,20>>& funded) {
+void worker(const std::unordered_set<std::array<unsigned char, 20>>& funded) {
     auto* ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
     std::ofstream out("addresses.txt", std::ios::app);
     std::vector<unsigned char> priv(32);
