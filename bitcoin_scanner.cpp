@@ -26,7 +26,7 @@ namespace fs = std::filesystem;
 static const char* BASE58_ALPHABET =
     "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
-// Tune this to your RAM/WSL constraints
+// Limits
 constexpr size_t MAX_FUNDED_ADDRESSES = 100000;
 
 // Fast XorShift64* RNG
@@ -41,56 +41,76 @@ struct XorShift64 {
     }
 };
 
-// Atomic counters
+// Progress counters
 std::atomic<uint64_t> total_checked{0};
 std::atomic<uint64_t> funded_loaded{0};
 std::mutex file_mutex;
 
-// Load plain TSV, shuffle & pick first MAX_FUNDED_ADDRESSES
-void loadLinesTxt(const std::string& path, std::unordered_set<std::string>& s) {
+// Reservoir sampling for plain TSV
+void reservoirSampleTxt(const std::string& path, std::vector<std::string>& reservoir) {
     std::ifstream in(path);
-    if (!in) { std::cerr<<"Error: cannot open "<<path<<"\n"; std::exit(1); }
-    std::vector<std::string> tmp;
-    tmp.reserve(MAX_FUNDED_ADDRESSES);
+    if (!in) { std::cerr << "Error: cannot open " << path << "\n"; std::exit(1); }
     std::string line;
+    size_t count = 0;
+    std::mt19937_64 gen(std::random_device{}());
     while (std::getline(in, line)) {
-        line.erase(std::remove_if(line.begin(), line.end(),
-            [](char c){ return c=='\r' || c=='\n'; }), line.end());
+        line.erase(std::remove_if(line.begin(), line.end(), [](char c){ return c=='\r' || c=='\n'; }), line.end());
         if (line.empty()) continue;
-        auto t = line.find('\t');
-        if (t != std::string::npos) line.resize(t);
-        tmp.push_back(std::move(line));
+        auto tab = line.find('\t');
+        if (tab != std::string::npos) line.resize(tab);
+        if (reservoir.size() < MAX_FUNDED_ADDRESSES) {
+            reservoir.push_back(line);
+        } else {
+            std::uniform_int_distribution<size_t> dist(0, count);
+            size_t idx = dist(gen);
+            if (idx < MAX_FUNDED_ADDRESSES) {
+                reservoir[idx] = line;
+            }
+        }
+        ++count;
     }
-    std::shuffle(tmp.begin(), tmp.end(), std::mt19937{std::random_device{}()});
-    for (size_t i = 0; i < tmp.size() && i < MAX_FUNDED_ADDRESSES; ++i)
-        s.insert(tmp[i]);
 }
 
-// Load funded addresses (TSV or TSV.GZ)
-std::unordered_set<std::string> loadFunded(const std::string& path) {
-    std::unordered_set<std::string> s;
-    s.reserve(MAX_FUNDED_ADDRESSES);
-    if (path.size()>3 && path.substr(path.size()-3)==".gz") {
-        gzFile gz = gzopen(path.c_str(),"rb");
-        if (!gz) { std::cerr<<"Error opening "<<path<<"\n"; std::exit(1); }
-        constexpr int BUF=1<<20; char buf[BUF];
-        std::vector<std::string> tmp; tmp.reserve(MAX_FUNDED_ADDRESSES);
-        while (gzgets(gz,buf,BUF)) {
-            std::string line(buf);
-            line.erase(std::remove_if(line.begin(), line.end(),
-                [](char c){ return c=='\r' || c=='\n'; }), line.end());
-            if (line.empty()) continue;
-            auto t = line.find('\t');
-            if (t != std::string::npos) line.resize(t);
-            tmp.push_back(std::move(line));
+// Reservoir sampling for gzipped TSV
+void reservoirSampleGz(const std::string& path, std::vector<std::string>& reservoir) {
+    gzFile gz = gzopen(path.c_str(), "rb");
+    if (!gz) { std::cerr << "Error: cannot open gz file: " << path << "\n"; std::exit(1); }
+    constexpr int BUF = 1<<20;
+    char buf[BUF];
+    size_t count = 0;
+    std::mt19937_64 gen(std::random_device{}());
+    while (gzgets(gz, buf, BUF)) {
+        std::string line(buf);
+        line.erase(std::remove_if(line.begin(), line.end(), [](char c){ return c=='\r' || c=='\n'; }), line.end());
+        if (line.empty()) continue;
+        auto tab = line.find('\t');
+        if (tab != std::string::npos) line.resize(tab);
+        if (reservoir.size() < MAX_FUNDED_ADDRESSES) {
+            reservoir.push_back(line);
+        } else {
+            std::uniform_int_distribution<size_t> dist(0, count);
+            size_t idx = dist(gen);
+            if (idx < MAX_FUNDED_ADDRESSES) {
+                reservoir[idx] = line;
+            }
         }
-        gzclose(gz);
-        std::shuffle(tmp.begin(), tmp.end(), std::mt19937{std::random_device{}()});
-        for (size_t i = 0; i < tmp.size() && i < MAX_FUNDED_ADDRESSES; ++i)
-            s.insert(tmp[i]);
-    } else {
-        loadLinesTxt(path, s);
+        ++count;
     }
+    gzclose(gz);
+}
+
+// Load funded addresses via reservoir sampling
+std::unordered_set<std::string> loadFunded(const std::string& path) {
+    std::vector<std::string> reservoir;
+    reservoir.reserve(MAX_FUNDED_ADDRESSES);
+    if (path.size()>3 && path.substr(path.size()-3)==".gz") {
+        reservoirSampleGz(path, reservoir);
+    } else {
+        reservoirSampleTxt(path, reservoir);
+    }
+    std::unordered_set<std::string> s;
+    s.reserve(reservoir.size());
+    for (auto& addr : reservoir) s.insert(std::move(addr));
     funded_loaded.store(s.size(), std::memory_order_relaxed);
     return s;
 }
@@ -103,16 +123,14 @@ inline void hash160(const std::vector<unsigned char>& in, unsigned char out[20])
 }
 
 // Base58Check (in-place)
-std::string base58Check(const std::vector<unsigned char>& data) {
+inline std::string base58Check(const std::vector<unsigned char>& data) {
     std::vector<unsigned char> buf = data;
     unsigned char sha1[SHA256_DIGEST_LENGTH], sha2[SHA256_DIGEST_LENGTH];
     SHA256(buf.data(), buf.size(), sha1);
     SHA256(sha1, SHA256_DIGEST_LENGTH, sha2);
     buf.insert(buf.end(), sha2, sha2+4);
-
     size_t zeros = 0;
     while (zeros < buf.size() && buf[zeros]==0) ++zeros;
-
     std::vector<unsigned char> temp(buf.begin(), buf.end());
     std::string res; res.reserve(buf.size()*138/100 + 1);
     size_t start = zeros;
@@ -140,23 +158,18 @@ void derive_and_check(
 {
     secp256k1_pubkey pub;
     if (!secp256k1_ec_pubkey_create(ctx, &pub, priv.data())) return;
-
-    // uncompressed
     unsigned char b1[65]; size_t l1=65;
     secp256k1_ec_pubkey_serialize(ctx, b1, &l1, &pub, SECP256K1_EC_UNCOMPRESSED);
-    std::vector<unsigned char> v1(b1,b1+l1);
-    unsigned char h1[20]; hash160(v1,h1);
-    std::vector<unsigned char> a1={0x00}; a1.insert(a1.end(),h1,h1+20);
+    std::vector<unsigned char> v1(b1, b1+l1);
+    unsigned char h1[20]; hash160(v1, h1);
+    std::vector<unsigned char> a1 = {0x00}; a1.insert(a1.end(), h1, h1+20);
     auto addr1 = base58Check(a1);
-
-    // compressed
     unsigned char b2[33]; size_t l2=33;
     secp256k1_ec_pubkey_serialize(ctx, b2, &l2, &pub, SECP256K1_EC_COMPRESSED);
-    std::vector<unsigned char> v2(b2,b2+l2);
-    unsigned char h2[20]; hash160(v2,h2);
-    std::vector<unsigned char> a2={0x00}; a2.insert(a2.end(),h2,h2+20);
+    std::vector<unsigned char> v2(b2, b2+l2);
+    unsigned char h2[20]; hash160(v2, h2);
+    std::vector<unsigned char> a2 = {0x00}; a2.insert(a2.end(), h2, h2+20);
     auto addr2 = base58Check(a2);
-
     std::lock_guard<std::mutex> g(file_mutex);
     if (funded.count(addr1)) {
         out<<addr1<<" PRIV:";
@@ -172,13 +185,11 @@ void derive_and_check(
 
 // Worker thread
 void worker(const std::unordered_set<std::string>& funded) {
-    XorShift64 rng(std::hash<std::thread::id>{}(std::this_thread::get_id())
-                   ^ std::random_device{}());
+    XorShift64 rng(std::hash<std::thread::id>{}(std::this_thread::get_id()) ^ std::random_device{}());
     auto* ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
     std::ofstream out("addresses.txt", std::ios::app);
     std::vector<unsigned char> priv(32);
     uint64_t local = 0;
-
     while (true) {
         for (int i = 0; i < 4; ++i) {
             uint64_t r = rng.next();
@@ -196,7 +207,6 @@ void worker(const std::unordered_set<std::string>& funded) {
 int main(int argc, char** argv) {
     std::ios::sync_with_stdio(false);
     std::cin.tie(nullptr);
-
     const std::string fname = "bitcoin_addresses_latest.tsv";
     std::vector<std::string> cands;
     if (argc>1) cands.push_back(argv[1]);
@@ -208,28 +218,13 @@ int main(int argc, char** argv) {
         cands.push_back(std::string(h) + "/" + fname);
         cands.push_back(std::string(h) + "/" + fname + ".gz");
     }
-
     std::string path;
-    for (auto& p : cands) {
-        if (fs::exists(p) && fs::is_regular_file(p)) {
-            path = p;
-            break;
-        }
-    }
-    if (path.empty()) {
-        std::cerr<<"Error: cannot find "<<fname<<"(.gz)\n";
-        return 1;
-    }
-
+    for (auto& p : cands) if (fs::exists(p) && fs::is_regular_file(p)) { path = p; break; }
+    if (path.empty()) { std::cerr<<"Error: cannot find "<<fname<<"(.gz)\n"; return 1; }
     std::cout<<"[*] Loading funded addresses...\n";
     auto funded = loadFunded(path);
     std::cout<<"[+] Loaded funded addresses: "<<funded_loaded.load()<<"\n";
-    if (funded.empty()) {
-        std::cerr<<"No addresses loaded - check file format.\n";
-        return 1;
-    }
-
-    // Progress reporter
+    if (funded.empty()) { std::cerr<<"No addresses loaded - check file format.\n"; return 1; }
     std::thread reporter([&](){
         uint64_t prev = 0;
         while (true) {
@@ -238,15 +233,11 @@ int main(int argc, char** argv) {
             std::cout<<"[*] Checked "<<now<<" keys (+"<<(now-prev)<<"/s)\n";
             prev = now;
         }
-    });
-    reporter.detach();
-
-    // Worker threads
+    }); reporter.detach();
     unsigned int n = std::max(1u, std::thread::hardware_concurrency() - 1);
     std::vector<std::thread> threads;
     for (unsigned i = 0; i < n; ++i)
         threads.emplace_back(worker, std::cref(funded));
     for (auto& t : threads) t.join();
-
     return 0;
 }
