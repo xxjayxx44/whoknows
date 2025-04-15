@@ -1,6 +1,6 @@
 CXX       = g++
-CXXFLAGS  = -std=c++17 -O3 -march=native -Wall -Wextra
-LDLIBS    = -lsecp256k1 -lssl -lcrypto -lz
+CXXFLAGS  = -std=c++17 -Ofast -march=native -flto -Wall -Wextra
+LDLIBS    = -lsecp256k1 -lssl -lcrypto -lz -pthread
 
 TARGET    = bitcoin_scanner
 SRC       = bitcoin_scanner.cpp
@@ -13,4 +13,4 @@ $(TARGET): $(SRC)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDLIBS)
 
 clean:
-	rm -f $(TARGET) addresses.txt
+	rm -f $(TARGET) address.txt
