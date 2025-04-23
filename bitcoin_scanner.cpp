@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -21,6 +22,7 @@
 #include <openssl/ripemd.h>
 #include <secp256k1.h>
 
+using namespace std;
 namespace fs = std::filesystem;
 
 // Custom hash for 20‐byte arrays
@@ -42,10 +44,10 @@ static const char* BASE58_ALPHABET =
 constexpr size_t MAX_FUNDED = 100000;
 
 // Shared state
-static std::atomic<uint64_t> total_checked{0};
-static std::atomic<uint64_t> funded_loaded{0};
-static std::atomic<bool> found{false};
-static std::mutex file_mutex;
+static atomic<uint64_t> total_checked{0};
+static atomic<uint64_t> funded_loaded{0};
+static atomic<bool> found{false};
+static mutex file_mutex;
 
 // Fast RNG
 struct XorShift64 {
@@ -56,13 +58,14 @@ struct XorShift64 {
   }
 };
 
-// Decode Base58 → bytes (little‐endian)
-static bool base58Decode(const std::string& str, std::vector<unsigned char>& out){
-  out.clear(); std::vector<unsigned char> buf; buf.reserve(str.size());
+// Decode Base58 → little-endian bytes
+static bool base58Decode(const string& str, vector<unsigned char>& out){
+  out.clear();
+  vector<unsigned char> buf; buf.reserve(str.size());
   for(char c:str){
-    auto p=strchr(BASE58_ALPHABET,c);
+    const char* p=strchr(BASE58_ALPHABET,c);
     if(!p) return false;
-    int d=int(p-BASE58_ALPHABET), carry=d;
+    int digit=int(p-BASE58_ALPHABET), carry=digit;
     for(size_t i=0;i<buf.size();++i){
       carry+=buf[i]*58;
       buf[i]=carry&0xFF; carry>>=8;
@@ -71,31 +74,31 @@ static bool base58Decode(const std::string& str, std::vector<unsigned char>& out
   }
   size_t zeros=0; for(char c:str){ if(c=='1') zeros++; else break; }
   out.assign(zeros,0);
-  for(auto it=buf.rbegin();it!=buf.rend();++it) out.push_back(*it);
+  for(auto it=buf.rbegin(); it!=buf.rend(); ++it) out.push_back(*it);
   return true;
 }
 
-// Decode Base58Check → 20‐byte payload
-static bool decodeBase58Check(const std::string& str, array<unsigned char,20>& out){
-  std::vector<unsigned char> full;
-  if(!base58Decode(str,full)||full.size()<5) return false;
-  size_t plen=full.size()-5;
+// Decode Base58Check → exactly 20-byte payload
+static bool decodeBase58Check(const string& str, array<unsigned char,20>& out){
+  vector<unsigned char> full;
+  if(!base58Decode(str, full) || full.size()<5) return false;
+  size_t plen = full.size()-5;
   if(plen!=20) return false;
   unsigned char h1[SHA256_DIGEST_LENGTH], h2[SHA256_DIGEST_LENGTH];
-  SHA256(full.data(),1+plen,h1);
-  SHA256(h1,SHA256_DIGEST_LENGTH,h2);
-  if(memcmp(h2, full.data()+1+plen,4)) return false;
-  memcpy(out.data(), full.data()+1,20);
+  SHA256(full.data(), 1+plen, h1);
+  SHA256(h1, SHA256_DIGEST_LENGTH, h2);
+  if(memcmp(h2, full.data()+1+plen, 4)!=0) return false;
+  memcpy(out.data(), full.data()+1, 20);
   return true;
 }
 
-// Reservoir‐sample up to MAX_FUNDED of decoded hash160s
+// Reservoir‐sample up to MAX_FUNDED of decoded 20-byte hash160s
 static unordered_set<array<unsigned char,20>> loadFunded(const string& path){
   vector<array<unsigned char,20>> R; R.reserve(MAX_FUNDED);
   size_t seen=0; mt19937_64 rng(random_device{}());
-  auto proc=[&](const string& l){
+  auto proc = [&](const string& ln){
     array<unsigned char,20> h;
-    if(!decodeBase58Check(l,h)) return;
+    if(!decodeBase58Check(ln,h)) return;
     if(seen<MAX_FUNDED) R.push_back(h);
     else {
       uniform_int_distribution<size_t> d(0,seen);
@@ -104,15 +107,16 @@ static unordered_set<array<unsigned char,20>> loadFunded(const string& path){
     }
     ++seen;
   };
-  if(path.size()>3&&path.substr(path.size()-3)==".gz"){
+
+  if(path.size()>3 && path.substr(path.size()-3)==".gz"){
     gzFile gz=gzopen(path.c_str(),"rb");
     if(!gz){ cerr<<"Cannot open "<<path<<"\n"; exit(1); }
     char buf[1<<20];
-    while(gzgets(gz,buf,sizeof(buf))) {
+    while(gzgets(gz,buf,sizeof(buf))){
       string s(buf);
       s.erase(remove_if(s.begin(),s.end(),[](char c){return c=='\r'||c=='\n';}),s.end());
       if(s.empty()) continue;
-      if(auto t=s.find('\t');t!=string::npos) s.resize(t);
+      if(auto t=s.find('\t'); t!=string::npos) s.resize(t);
       proc(s);
     }
     gzclose(gz);
@@ -123,30 +127,33 @@ static unordered_set<array<unsigned char,20>> loadFunded(const string& path){
     while(getline(in,s)){
       s.erase(remove_if(s.begin(),s.end(),[](char c){return c=='\r'||c=='\n';}),s.end());
       if(s.empty()) continue;
-      if(auto t=s.find('\t');t!=string::npos) s.resize(t);
+      if(auto t=s.find('\t'); t!=string::npos) s.resize(t);
       proc(s);
     }
   }
-  unordered_set<array<unsigned char,20>> set; set.reserve(R.size());
-  for(auto&a:R) set.insert(a);
-  funded_loaded.store(set.size(),memory_order_relaxed);
+
+  unordered_set<array<unsigned char,20>> set;
+  set.reserve(R.size());
+  for(auto &h:R) set.insert(h);
+  funded_loaded.store(set.size(), memory_order_relaxed);
   return set;
 }
 
-// hash160 = RIPEMD160(SHA256(data))
+// SHA256→RIPEMD160
 static inline void hash160(const unsigned char* d, size_t n, unsigned char o[20]){
   unsigned char sha[SHA256_DIGEST_LENGTH];
   SHA256(d,n,sha);
   RIPEMD160(sha,SHA256_DIGEST_LENGTH,o);
 }
 
-// Base58Check encode (raw ptr)
+// Base58Check encode from raw buffer
 static string base58Check(const unsigned char* data, size_t len){
   vector<unsigned char> buf(data,data+len);
   unsigned char h1[SHA256_DIGEST_LENGTH], h2[SHA256_DIGEST_LENGTH];
   SHA256(buf.data(),buf.size(),h1);
   SHA256(h1,SHA256_DIGEST_LENGTH,h2);
   buf.insert(buf.end(),h2,h2+4);
+
   size_t zeros=0; while(zeros<buf.size()&&buf[zeros]==0) ++zeros;
   vector<unsigned char> tmp(buf.begin(),buf.end());
   string res; res.reserve(buf.size()*138/100+1);
@@ -165,7 +172,7 @@ static string base58Check(const unsigned char* data, size_t len){
   return res;
 }
 
-// derive compressed pubkey, match raw, and on hit log
+// Derive compressed pubkey, compare raw h160, log on hit
 static void derive_and_check(
   const unsigned char priv[32],
   secp256k1_context* ctx,
@@ -185,12 +192,12 @@ static void derive_and_check(
   memcpy(arr.data(),h,20);
 
   if(funded.count(arr)){
-    // hex64
+    // PRIV_HEX
     char hex64[65];
     static const char* hm="0123456789abcdef";
     for(int i=0;i<32;++i){
-      hex64[2*i]  = hm[(priv[i]>>4)&0xF];
-      hex64[2*i+1]= hm[priv[i]&0xF];
+      hex64[2*i]   = hm[(priv[i]>>4)&0xF];
+      hex64[2*i+1] = hm[priv[i]&0xF];
     }
     hex64[64]='\0';
 
@@ -201,11 +208,11 @@ static void derive_and_check(
     wifd[33]=0x01;
     string wif = base58Check(wifd,34);
 
-    // address
+    // Address
     unsigned char adr[21];
     adr[0]=0x00;
     memcpy(adr+1,h,20);
-    string addr = base58Check(adr,21);
+    string addr=base58Check(adr,21);
 
     {
       lock_guard<mutex> g(file_mutex);
@@ -217,10 +224,10 @@ static void derive_and_check(
   }
 }
 
-// worker thread
+// Worker thread
 static void worker(const unordered_set<array<unsigned char,20>>& funded){
   XorShift64 rng(hash<thread::id>()(this_thread::get_id()) ^ random_device{}());
-  auto* ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
+  auto* ctx=secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
   ofstream out("addresses.txt",ios::app);
   unsigned char priv[32];
   uint64_t local=0;
@@ -228,7 +235,8 @@ static void worker(const unordered_set<array<unsigned char,20>>& funded){
   while(!found.load()){
     for(int i=0;i<4;++i){
       uint64_t r=rng.next();
-      for(int b=0;b<8;++b) priv[i*8+b] = (r>>(8*b))&0xFF;
+      for(int b=0;b<8;++b)
+        priv[i*8+b]=(r>>(8*b))&0xFF;
     }
     derive_and_check(priv,ctx,funded,out);
     if(++local>=1024){
@@ -258,17 +266,19 @@ int main(int argc,char**argv){
   for(auto&p:cands)
     if(fs::exists(p)&&fs::is_regular_file(p)){ path=p; break; }
   if(path.empty()){
-    cerr<<"Cannot find "<<fname<<"\n"; return 1;
+    cerr<<"Cannot find "<<fname<<"\n";
+    return 1;
   }
 
   cout<<"[*] Sampling up to "<<MAX_FUNDED<<" funded addresses...\n";
   auto funded = loadFunded(path);
   cout<<"[+] Loaded "<<funded_loaded.load()<<" funded addresses.\n";
   if(funded.empty()){
-    cerr<<"No addresses loaded—check format.\n"; return 1;
+    cerr<<"No addresses loaded—check format.\n";
+    return 1;
   }
 
-  // progress
+  // Progress reporter
   thread rep([&](){
     uint64_t prev=0;
     while(!found.load()){
@@ -280,11 +290,11 @@ int main(int argc,char**argv){
   });
   rep.detach();
 
-  // spawn all hardware threads
+  // Spawn one thread per hardware core
   unsigned int n=thread::hardware_concurrency();
   vector<thread> thr;
   thr.reserve(n);
-  for(unsigned i=0;i<n;++i) thr.emplace_back(worker,ref(funded));
+  for(unsigned i=0;i<n;++i) thr.emplace_back(worker, funded);
   for(auto&t:thr) t.join();
 
   cout<<"[!] Hit found—exiting.\n";
